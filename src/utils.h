@@ -17,7 +17,7 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
-#include <function2/function2.hpp>
+#include "../lib/function2/include/function2/function2.hpp"
 
 /**
  * Run some function on the message thread. This function will be executed

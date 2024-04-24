@@ -354,231 +354,231 @@ void SpectralCompressorProcessor::processBlockBypassed(
 void SpectralCompressorProcessor::processBlock(
     juce::AudioBuffer<float>& buffer,
     juce::MidiBuffer& /*midiMessages*/) {
-    juce::ScopedNoDenormals noDenormals;
-
-    juce::AudioBuffer<float> main_io = getBusBuffer(buffer, true, 0);
-    juce::AudioBuffer<float> sidechain_io = getBusBuffer(buffer, true, 1);
-
-    juce::dsp::AudioBlock<float> main_block(main_io);
-    mixer_.setWetMixProportion(dry_wet_ratio_);
-    mixer_.pushDrySamples(main_block);
-
-    ProcessData& process_data = process_data_.get();
-    const double effective_sample_rate =
-        getSampleRate() /
-        (static_cast<double>(process_data.stft->fft_window_size) /
-         (1 << windowing_overlap_order_));
-    const float fft_frequency_increment =
-        getSampleRate() / process_data.stft->fft_window_size;
-    const MultiwayCompressor<float>::Mode compressor_mode =
-        static_cast<MultiwayCompressor<float>::Mode>(
-            compressor_mode_.getIndex());
-
-    // We have two different gain stages: just before the FFT transformations,
-    // after the FFT transformations (the makeup gain). As part of the makeup
-    // gain we also compensate for the overlap caused by our windowing. We don't
-    // need any manual ramps or fades here because that's already included in
-    // our Hanning windows.
-    // TODO: We should probably also compensate for different FFT window sizes
-    const float input_gain =
-        juce::Decibels::decibelsToGain(static_cast<float>(input_gain_db_));
-    float makeup_gain =
-        (1.0f / (1 << windowing_overlap_order_)) *
-        juce::Decibels::decibelsToGain(static_cast<float>(output_gain_db_));
-    // Obviously don't apply auto makeup gain when doing upwards compression,
-    // that will just blow up speakers
-    if (auto_makeup_gain_) {
-        makeup_gain *= 1.0f / input_gain;
-
-        // FIXME: None of this makes any sense! But it works for our current
-        //        parameters. At some point, come up with a more
-        //        mathematically justified auto gaining algorithm.
-        if (compressor_mode != MultiwayCompressor<float>::Mode::upwards) {
-            if (sidechain_active_) {
-                // Not really sure what makes sense here
-                // TODO: Take base threshold into account
-                makeup_gain *= (compressor_ratio_ + 24.0f) / 25.0f;
-            } else {
-                // TODO: Make this smarter, make it take all of the compressor
-                //       parameters into account. It will probably start making
-                //       sense once we add parameters for the threshold and
-                //       ratio.
-                makeup_gain *=
-                    compressor_ratio_ > 1.0
-                        ? ((std::log10(compressor_ratio_ * 100.00f) * 200.0f) -
-                           399.0f) *
-                              (input_gain)
-                        : 1.0f;
-            }
-        }
-    }
-
-    auto preprocess_fn = [input_gain](std::span<float>& samples,
-                                      size_t /*channel*/) {
-        // We apply the input gain after the windowing, just before the forward
-        // FFT transformation
-        // TODO: This could be folded into the windowing function with a FMA
-        juce::FloatVectorOperations::multiply(samples.data(), input_gain,
-                                              samples.size());
-    };
-
-    auto process_fn = [this, compressor_mode, effective_sample_rate,
-                       fft_frequency_increment, &process_data](
-                          std::span<std::complex<float>>& fft, size_t channel) {
-        // We'll update the compressor settings just before processing if the
-        // settings have changed or if the sidechaining has been disabled
-        bool expected = true;
-        const bool update_compressors_now =
-            compressor_settings_changed_.compare_exchange_weak(expected, false);
-
-        // If any timing related settings change (so the FFT window size or the
-        // amount of overlap), we'll need to adjust our compressors accordingly.
-        // Since this process can cause pops and clicks, we only do it when
-        // necessary.
-        const bool update_sample_rate_now =
-            last_effective_sample_rate_ != effective_sample_rate;
-        last_effective_sample_rate_ = effective_sample_rate;
-
-        // We'll compress every FTT bin individually. Bin 0 is the DC offset and
-        // should be skipped, and the latter half of the FFT bins should be
-        // processed in the same way as the first half but in reverse order. The
-        // real and imaginary parts are interleaved, so ever bin spans two
-        // values in the scratch buffer. We can 'safely' do this cast so we can
-        // use the STL's complex value functions.
-        for (size_t compressor_idx = 0;
-             compressor_idx < process_data.spectral_compressors.size();
-             compressor_idx++) {
-            auto& compressor =
-                process_data.spectral_compressors[compressor_idx];
-            // We don't have a compressor for the first bin
-            const size_t bin_idx = compressor_idx + 1;
-
-            if (update_compressors_now) {
-                compressor.set_mode(compressor_mode);
-                compressor.set_multiway_deadzone(compressor_multiway_deadzone_);
-                compressor.set_ratio(compressor_ratio_);
-                compressor.set_attack(compressor_attack_ms_);
-                compressor.set_release(compressor_release_ms_);
-                // TODO: The user should be able to configure their own slope
-                //       (or free drawn)
-                // TODO: Change the calculations so that the base threshold
-                //       parameter is centered around some frequency
-                // TODO: And we should be doing both upwards and downwards
-                //       compression, OTT-style
-                if (!sidechain_active_) {
-                    constexpr float base_threshold_dbfs = 0.0f;
-                    const float frequency = fft_frequency_increment * bin_idx;
-
-                    // This starts at 1 for 0 Hz (DC)
-                    const float octave = std::log2(frequency + 2);
-
-                    // The 3 dB is to compensate for bin 0
-                    compressor.set_threshold((base_threshold_dbfs + 3.0f) -
-                                             (3.0f * octave));
-                }
-            }
-
-            if (update_sample_rate_now) {
-                // TODO: This prepare resets the envelope follower, which is not
-                //       what we want. In our own compressor we should have a
-                //       way to just change the sample rate.
-                // TODO: Now that the timings are compensated for changing
-                //       window intervals, we might not need this to be
-                //       configurable anymore can just leave this fixed at 4x.
-                compressor.prepare(juce::dsp::ProcessSpec{
-                    // We only process everything once every
-                    // `windowing_interval`, otherwise our attack and release
-                    // times will be all messed up
-                    .sampleRate = effective_sample_rate,
-                    .maximumBlockSize = max_samples_per_block_,
-                    .numChannels =
-                        static_cast<uint32>(getMainBusNumInputChannels())});
-            }
-
-            const float magnitude = std::abs(fft[bin_idx]);
-            const float compressed_magnitude =
-                compressor.process_sample(channel, magnitude);
-
-            // We need to scale both the imaginary and real components of the
-            // bins at the start and end of the spectrum by the same value
-            // TODO: Add stereo linking
-            const float compression_multiplier =
-                magnitude != 0.0f ? compressed_magnitude / magnitude : 1.0f;
-
-            // Since we're usign the real-only FFT operations we don't need to
-            // touch the second, mirrored half of the FFT bins
-            fft[bin_idx] *= compression_multiplier;
-        }
-
-        // TODO: We might need some kind of optional limiting stage to
-        //       be safe
-        // TODO: We should definitely add a way to recover transients
-        //       from the original input audio, that sounds really good
-
-        if (dc_filter_) {
-            fft[0] = 0;
-        }
-    };
-
-    auto postprocess_fn = [](std::span<float>& /*samples*/,
-                             size_t /*channel*/) {};
-
-    // We'll process the input signal in windows, using overlap-add
-    if (sidechain_active_) {
-        process_data.stft->process(
-            main_io, sidechain_io, 1 << windowing_overlap_order_, makeup_gain,
-            [&process_data](const std::span<std::complex<float>>& fft,
-                            size_t /*channel*/) {
-                // If sidechaining is active, we set the compressor thresholds
-                // based on a sidechain signal. Since compression is already
-                // ballistics based we don't need any additional smoothing when
-                // updating those thresholds.
-                for (size_t compressor_idx = 0;
-                     compressor_idx < process_data.spectral_compressors.size();
-                     compressor_idx++) {
-                    const size_t bin_idx = compressor_idx + 1;
-                    const float magnitude = std::abs(fft[bin_idx]);
-
-                    // We'll set the compressor threshold based on the
-                    // arithmetic mean of the magnitudes of all channels. As
-                    // a slight premature optimization (sorry) we'll reset
-                    // these magnitudes after using them to avoid the
-                    // conditional here.
-                    process_data.spectral_compressor_sidechain_thresholds
-                        [compressor_idx] += magnitude;
-                }
-            },
-            [this, &process_data,
-             num_channels = sidechain_io.getNumChannels()]() {
-                // After adding up the magnitudes for each bin in
-                // `process_data.spectral_compressor_sidechain_thresholds` we
-                // want to actually configure the compressor thresholds based on
-                // the mean across the different channels
-                for (size_t compressor_idx = 0;
-                     compressor_idx < process_data.spectral_compressors.size();
-                     compressor_idx++) {
-                    const float mean_magnitude =
-                        process_data.spectral_compressor_sidechain_thresholds
-                            [compressor_idx] /
-                        num_channels;
-                    process_data.spectral_compressors[compressor_idx]
-                        .set_threshold(sidechain_exponential_
-                                           ? mean_magnitude
-                                           : juce::Decibels::gainToDecibels(
-                                                 mean_magnitude));
-                    process_data.spectral_compressor_sidechain_thresholds
-                        [compressor_idx] = 0;
-                }
-            },
-            preprocess_fn, process_fn, postprocess_fn);
-    } else {
-        process_data.stft->process(main_io, 1 << windowing_overlap_order_,
-                                   makeup_gain, preprocess_fn, process_fn,
-                                   postprocess_fn);
-    }
-
-    mixer_.setWetLatency(process_data.stft->latency_samples());
-    mixer_.mixWetSamples(main_block);
+//    juce::ScopedNoDenormals noDenormals;
+//
+//    juce::AudioBuffer<float> main_io = getBusBuffer(buffer, true, 0);
+//    juce::AudioBuffer<float> sidechain_io = getBusBuffer(buffer, true, 1);
+//
+//    juce::dsp::AudioBlock<float> main_block(main_io);
+//    mixer_.setWetMixProportion(dry_wet_ratio_);
+//    mixer_.pushDrySamples(main_block);
+//
+//    ProcessData& process_data = process_data_.get();
+//    const double effective_sample_rate =
+//        getSampleRate() /
+//        (static_cast<double>(process_data.stft->fft_window_size) /
+//         (1 << windowing_overlap_order_));
+//    const float fft_frequency_increment =
+//        getSampleRate() / process_data.stft->fft_window_size;
+//    const MultiwayCompressor<float>::Mode compressor_mode =
+//        static_cast<MultiwayCompressor<float>::Mode>(
+//            compressor_mode_.getIndex());
+//
+//    // We have two different gain stages: just before the FFT transformations,
+//    // after the FFT transformations (the makeup gain). As part of the makeup
+//    // gain we also compensate for the overlap caused by our windowing. We don't
+//    // need any manual ramps or fades here because that's already included in
+//    // our Hanning windows.
+//    // TODO: We should probably also compensate for different FFT window sizes
+//    const float input_gain =
+//        juce::Decibels::decibelsToGain(static_cast<float>(input_gain_db_));
+//    float makeup_gain =
+//        (1.0f / (1 << windowing_overlap_order_)) *
+//        juce::Decibels::decibelsToGain(static_cast<float>(output_gain_db_));
+//    // Obviously don't apply auto makeup gain when doing upwards compression,
+//    // that will just blow up speakers
+//    if (auto_makeup_gain_) {
+//        makeup_gain *= 1.0f / input_gain;
+//
+//        // FIXME: None of this makes any sense! But it works for our current
+//        //        parameters. At some point, come up with a more
+//        //        mathematically justified auto gaining algorithm.
+//        if (compressor_mode != MultiwayCompressor<float>::Mode::upwards) {
+//            if (sidechain_active_) {
+//                // Not really sure what makes sense here
+//                // TODO: Take base threshold into account
+//                makeup_gain *= (compressor_ratio_ + 24.0f) / 25.0f;
+//            } else {
+//                // TODO: Make this smarter, make it take all of the compressor
+//                //       parameters into account. It will probably start making
+//                //       sense once we add parameters for the threshold and
+//                //       ratio.
+//                makeup_gain *=
+//                    compressor_ratio_ > 1.0
+//                        ? ((std::log10(compressor_ratio_ * 100.00f) * 200.0f) -
+//                           399.0f) *
+//                              (input_gain)
+//                        : 1.0f;
+//            }
+//        }
+//    }
+//
+//    auto preprocess_fn = [input_gain](std::span<float>& samples,
+//                                      size_t /*channel*/) {
+//        // We apply the input gain after the windowing, just before the forward
+//        // FFT transformation
+//        // TODO: This could be folded into the windowing function with a FMA
+//        juce::FloatVectorOperations::multiply(samples.data(), input_gain,
+//                                              samples.size());
+//    };
+//
+//    auto process_fn = [this, compressor_mode, effective_sample_rate,
+//                       fft_frequency_increment, &process_data](
+//                          std::span<std::complex<float>>& fft, size_t channel) {
+//        // We'll update the compressor settings just before processing if the
+//        // settings have changed or if the sidechaining has been disabled
+//        bool expected = true;
+//        const bool update_compressors_now =
+//            compressor_settings_changed_.compare_exchange_weak(expected, false);
+//
+//        // If any timing related settings change (so the FFT window size or the
+//        // amount of overlap), we'll need to adjust our compressors accordingly.
+//        // Since this process can cause pops and clicks, we only do it when
+//        // necessary.
+//        const bool update_sample_rate_now =
+//            last_effective_sample_rate_ != effective_sample_rate;
+//        last_effective_sample_rate_ = effective_sample_rate;
+//
+//        // We'll compress every FTT bin individually. Bin 0 is the DC offset and
+//        // should be skipped, and the latter half of the FFT bins should be
+//        // processed in the same way as the first half but in reverse order. The
+//        // real and imaginary parts are interleaved, so ever bin spans two
+//        // values in the scratch buffer. We can 'safely' do this cast so we can
+//        // use the STL's complex value functions.
+//        for (size_t compressor_idx = 0;
+//             compressor_idx < process_data.spectral_compressors.size();
+//             compressor_idx++) {
+//            auto& compressor =
+//                process_data.spectral_compressors[compressor_idx];
+//            // We don't have a compressor for the first bin
+//            const size_t bin_idx = compressor_idx + 1;
+//
+//            if (update_compressors_now) {
+//                compressor.set_mode(compressor_mode);
+//                compressor.set_multiway_deadzone(compressor_multiway_deadzone_);
+//                compressor.set_ratio(compressor_ratio_);
+//                compressor.set_attack(compressor_attack_ms_);
+//                compressor.set_release(compressor_release_ms_);
+//                // TODO: The user should be able to configure their own slope
+//                //       (or free drawn)
+//                // TODO: Change the calculations so that the base threshold
+//                //       parameter is centered around some frequency
+//                // TODO: And we should be doing both upwards and downwards
+//                //       compression, OTT-style
+//                if (!sidechain_active_) {
+//                    constexpr float base_threshold_dbfs = 0.0f;
+//                    const float frequency = fft_frequency_increment * bin_idx;
+//
+//                    // This starts at 1 for 0 Hz (DC)
+//                    const float octave = std::log2(frequency + 2);
+//
+//                    // The 3 dB is to compensate for bin 0
+//                    compressor.set_threshold((base_threshold_dbfs + 3.0f) -
+//                                             (3.0f * octave));
+//                }
+//            }
+//
+//            if (update_sample_rate_now) {
+//                // TODO: This prepare resets the envelope follower, which is not
+//                //       what we want. In our own compressor we should have a
+//                //       way to just change the sample rate.
+//                // TODO: Now that the timings are compensated for changing
+//                //       window intervals, we might not need this to be
+//                //       configurable anymore can just leave this fixed at 4x.
+//                compressor.prepare(juce::dsp::ProcessSpec{
+//                    // We only process everything once every
+//                    // `windowing_interval`, otherwise our attack and release
+//                    // times will be all messed up
+//                    .sampleRate = effective_sample_rate,
+//                    .maximumBlockSize = max_samples_per_block_,
+//                    .numChannels =
+//                        static_cast<uint32>(getMainBusNumInputChannels())});
+//            }
+//
+//            const float magnitude = std::abs(fft[bin_idx]);
+//            const float compressed_magnitude =
+//                compressor.process_sample(channel, magnitude);
+//
+//            // We need to scale both the imaginary and real components of the
+//            // bins at the start and end of the spectrum by the same value
+//            // TODO: Add stereo linking
+//            const float compression_multiplier =
+//                magnitude != 0.0f ? compressed_magnitude / magnitude : 1.0f;
+//
+//            // Since we're usign the real-only FFT operations we don't need to
+//            // touch the second, mirrored half of the FFT bins
+//            fft[bin_idx] *= compression_multiplier;
+//        }
+//
+//        // TODO: We might need some kind of optional limiting stage to
+//        //       be safe
+//        // TODO: We should definitely add a way to recover transients
+//        //       from the original input audio, that sounds really good
+//
+//        if (dc_filter_) {
+//            fft[0] = 0;
+//        }
+//    };
+//
+//    auto postprocess_fn = [](std::span<float>& /*samples*/,
+//                             size_t /*channel*/) {};
+//
+//    // We'll process the input signal in windows, using overlap-add
+//    if (sidechain_active_) {
+//        process_data.stft->process(
+//            main_io, sidechain_io, 1 << windowing_overlap_order_, makeup_gain,
+//            [&process_data](const std::span<std::complex<float>>& fft,
+//                            size_t /*channel*/) {
+//                // If sidechaining is active, we set the compressor thresholds
+//                // based on a sidechain signal. Since compression is already
+//                // ballistics based we don't need any additional smoothing when
+//                // updating those thresholds.
+//                for (size_t compressor_idx = 0;
+//                     compressor_idx < process_data.spectral_compressors.size();
+//                     compressor_idx++) {
+//                    const size_t bin_idx = compressor_idx + 1;
+//                    const float magnitude = std::abs(fft[bin_idx]);
+//
+//                    // We'll set the compressor threshold based on the
+//                    // arithmetic mean of the magnitudes of all channels. As
+//                    // a slight premature optimization (sorry) we'll reset
+//                    // these magnitudes after using them to avoid the
+//                    // conditional here.
+//                    process_data.spectral_compressor_sidechain_thresholds
+//                        [compressor_idx] += magnitude;
+//                }
+//            },
+//            [this, &process_data,
+//             num_channels = sidechain_io.getNumChannels()]() {
+//                // After adding up the magnitudes for each bin in
+//                // `process_data.spectral_compressor_sidechain_thresholds` we
+//                // want to actually configure the compressor thresholds based on
+//                // the mean across the different channels
+//                for (size_t compressor_idx = 0;
+//                     compressor_idx < process_data.spectral_compressors.size();
+//                     compressor_idx++) {
+//                    const float mean_magnitude =
+//                        process_data.spectral_compressor_sidechain_thresholds
+//                            [compressor_idx] /
+//                        num_channels;
+//                    process_data.spectral_compressors[compressor_idx]
+//                        .set_threshold(sidechain_exponential_
+//                                           ? mean_magnitude
+//                                           : juce::Decibels::gainToDecibels(
+//                                                 mean_magnitude));
+//                    process_data.spectral_compressor_sidechain_thresholds
+//                        [compressor_idx] = 0;
+//                }
+//            },
+//            preprocess_fn, process_fn, postprocess_fn);
+//    } else {
+//        process_data.stft->process(main_io, 1 << windowing_overlap_order_,
+//                                   makeup_gain, preprocess_fn, process_fn,
+//                                   postprocess_fn);
+//    }
+//
+//    mixer_.setWetLatency(process_data.stft->latency_samples());
+//    mixer_.mixWetSamples(main_block);
 }
 
 bool SpectralCompressorProcessor::hasEditor() const {
